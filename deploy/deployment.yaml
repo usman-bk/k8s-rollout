@@ -1,0 +1,111 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: probed
+  labels: { app: probed }
+spec:
+  replicas: 3
+  selector:
+    matchLabels: { app: probed }
+
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      # Up before down. With maxUnavailable above zero a rollout removes
+      # capacity before it adds any, which on three replicas means losing
+      # a third of the fleet during every deploy.
+      maxUnavailable: 0
+      maxSurge: 1
+
+  template:
+    metadata:
+      labels: { app: probed }
+    spec:
+      # Drain plus shutdown plus a margin, from Timings.GracePeriod().
+      # When this expires the kubelet sends SIGKILL and whatever is still
+      # running is cut off mid response, so it has to be longer than the
+      # application's own sequence. There is a test that compares the two.
+      terminationGracePeriodSeconds: 30
+
+      containers:
+        - name: probed
+          image: ghcr.io/usmanvirk/probed:latest
+          ports:
+            - { name: http, containerPort: 8080 }
+
+          env:
+            - { name: DRAIN, value: "5s" }
+            - { name: SHUTDOWN, value: "20s" }
+
+          # Startup, liveness and readiness are three different questions.
+          #
+          # The startup probe exists so a slow start does not force a long
+          # initialDelaySeconds on liveness. A long initial delay would
+          # also delay detecting a hang for the whole life of the pod,
+          # which is the opposite of what liveness is for.
+          startupProbe:
+            httpGet: { path: /startupz, port: http }
+            periodSeconds: 1
+            # 30 seconds to start, after which the pod is restarted.
+            failureThreshold: 30
+
+          # Liveness answers "is this stuck", and the only response to it
+          # failing is a restart. It checks nothing but the process, so a
+          # database outage cannot restart the fleet.
+          livenessProbe:
+            httpGet: { path: /healthz, port: http }
+            periodSeconds: 10
+            timeoutSeconds: 3
+            # Three in a row. One failed probe is a blip; restarting on a
+            # blip is how a busy afternoon becomes an outage.
+            failureThreshold: 3
+
+          # Readiness answers "should this pod get traffic". It fails on a
+          # failing dependency and during the drain.
+          readinessProbe:
+            httpGet: { path: /readyz, port: http }
+            periodSeconds: 2
+            timeoutSeconds: 3
+            # One. Readiness failing costs nothing but routing, and the
+            # faster a draining pod leaves the Service the fewer requests
+            # arrive at a pod that is going away.
+            failureThreshold: 1
+            successThreshold: 1
+
+          resources:
+            requests: { cpu: 100m, memory: 128Mi }
+            # No CPU limit, deliberately. A CPU limit throttles the
+            # container at the quota even when the node is idle, and the
+            # symptom is p99 latency nobody can explain. Memory is limited
+            # because the failure mode there is taking the node with it.
+            limits: { memory: 256Mi }
+
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 10001
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: { drop: ["ALL"] }
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: probed
+spec:
+  selector: { app: probed }
+  ports:
+    - { name: http, port: 80, targetPort: http }
+
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: probed
+spec:
+  # A node drain is the other way a rollout loses capacity, and the
+  # deployment strategy says nothing about it. Without this, draining a
+  # node can evict every replica at once.
+  minAvailable: 2
+  selector:
+    matchLabels: { app: probed }

@@ -1,0 +1,50 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.23'
+
+      - run: go build ./...
+      - run: go vet ./...
+      - name: Formatting
+        run: |
+          u=$(gofmt -l .)
+          if [ -n "$u" ]; then echo "gofmt would change:"; echo "$u"; exit 1; fi
+
+      - run: go test -race ./...
+
+      # The drain is a timing property, and one that holds once on an idle
+      # runner is not a property. A shared runner under load is where this
+      # would flake if it were going to.
+      - name: Hammer the rollout
+        run: go test -race -count=5 ./internal/lifecycle/ -run 'Rollout|Drain|InFlight'
+
+      # The manifest is only worth testing if the test can fail, so break
+      # it on purpose and require that it does.
+      - name: The manifest tests can fail
+        run: |
+          cp deploy/deployment.yaml /tmp/deployment.yaml.bak
+          sed -i 's/terminationGracePeriodSeconds: 30/terminationGracePeriodSeconds: 5/' deploy/deployment.yaml
+          if go test ./internal/lifecycle/ -run TestTheGracePeriod; then
+            echo "the grace period test passed with a 5 second grace period, so it checks nothing"
+            cp /tmp/deployment.yaml.bak deploy/deployment.yaml
+            exit 1
+          fi
+          cp /tmp/deployment.yaml.bak deploy/deployment.yaml
+
+      - name: Validate the manifest
+        run: |
+          curl -sSLo /usr/local/bin/kubeconform.tar.gz \
+            https://github.com/yannh/kubeconform/releases/download/v0.6.7/kubeconform-linux-amd64.tar.gz
+          tar -xzf /usr/local/bin/kubeconform.tar.gz -C /usr/local/bin kubeconform
+          kubeconform -strict -summary deploy/deployment.yaml
